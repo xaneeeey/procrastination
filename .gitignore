@@ -1,0 +1,34 @@
+# dependencies
+node_modules/
+
+# builds
+dist/
+dist-electron/
+release/
+.vite/
+*.tsbuildinfo
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+#local agent/tool state
+.aura/
+.claude/
+.codex/
+.agents/
+# optional: only if screenshots are temporary
+screenshots/
