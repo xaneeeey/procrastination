@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { Shield, ShieldAlert, RefreshCw, Sparkles, Globe } from 'lucide-react';
 import { useStore } from '../lib/store';
-import TerminalView from './Terminal';
+import AiTerminal from './AiTerminal';
 
 type AiKind = 'claude' | 'codex';
 
@@ -11,52 +11,150 @@ const AI_LABEL: Record<AiKind, string> = {
   codex: 'codex',
 };
 
-const AI_BIN: Record<AiKind, string> = {
-  claude: 'claude',
-  codex: 'codex',
-};
-
-function bypassFlag(kind: AiKind): string[] {
-  if (kind === 'claude') return ['--dangerously-skip-permissions'];
-  if (kind === 'codex') return ['--dangerously-bypass-approvals-and-sandbox'];
-  return [];
-}
-
-// Strip ANSI escape sequences so we only count real text content
 const ANSI_STRIP = /\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b./g;
 
-// Burst-based activity tracker — module-level to survive React re-renders.
-//
-// Open logic:  accumulate non-ws chars in a burst window; open once 250+ chars land.
-//              Shell PS1 prompts (~20 non-ws) never reach the threshold on their own.
-//
-// Close logic: separately track the last time a LARGE chunk (50+ non-ws chars)
-//              arrived. Shell prompts are small and won't reset this timer.
-//              After MIN_OPEN_MS has elapsed AND IDLE_CLOSE_MS has passed since the
-//              last large chunk, the browser auto-closes.
-type WorkingTracker = {
-  startedAt: number;         // when this PTY was spawned (for startup grace)
-  lastDataAt: number;        // any data after grace (for burst decay)
-  lastLargeDataAt: number;   // large-chunk timestamp (for auto-close idle check)
-  accumulated: number;       // burst char accumulator
-  browserOpened: boolean;    // true once this tracker triggered an open
+// Output must flow continuously for this long before we treat it as real work.
+// /resume and startup banners finish in < 500ms and never hit this threshold.
+const SUSTAINED_MS = 3_000;
+// How long after output stops before we close the browser.
+const IDLE_MS = 7_000;
+
+// ─── Module-level state (survives React re-renders) ─────────────────────────
+
+let autoOpenedAt = 0;
+let idleCloseTimer: ReturnType<typeof setTimeout> | null = null;
+
+// How many recent fingerprints to remember. Ink CLIs (codex, claude) re-render
+// their idle prompt in a small cycle of 2-4 slightly different frames. If the
+// current chunk matches any of the last WINDOW recent frames, it's repetitive
+// idle rendering — don't reset the idle timer.
+const FP_WINDOW = 8;
+
+type PtyTracker = {
+  inputBuffer: string;
+  hasSentPrompt: boolean;
+  recentFps: string[];   // rolling window of recent fingerprints
+  // True after any slash command until the next Enter is consumed.
+  // /resume shows a numbered session list; the user types "1" and presses Enter
+  // to select — that Enter looks like a real prompt but isn't. We suppress it
+  // when it's digit-only (a menu selection) and clear the flag either way.
+  slashInteractionActive: boolean;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+  sustainedTimer: ReturnType<typeof setTimeout> | null;
 };
 
-const STARTUP_GRACE_MS = 8_000;   // skip shell init / AI banner noise
-const BURST_THRESHOLD  = 250;     // non-ws chars needed to open browser
-const BURST_DECAY_MS   = 12_000;  // reset accumulator after this much idle
-const LARGE_CHUNK_MIN  = 50;      // non-ws chars = "significant AI output"
-const IDLE_CLOSE_MS    = 30_000;  // close after 30s with no significant output
-const MIN_OPEN_MS      = 20_000;  // keep browser open at least 20s (no flicker)
+function makeTracker(): PtyTracker {
+  return { inputBuffer: '', hasSentPrompt: false, recentFps: [], slashInteractionActive: false, idleTimer: null, sustainedTimer: null };
+}
 
-// Module-level timestamp: set when browser auto-opens, cleared when it closes.
-// 0 = browser was manually opened (or never auto-opened) → interval won't close it.
-let browserAutoOpenedAt = 0;
+function clearTracker(t: PtyTracker) {
+  t.inputBuffer = '';
+  t.hasSentPrompt = false;
+  t.recentFps = [];
+  t.slashInteractionActive = false;
+  if (t.idleTimer)      { clearTimeout(t.idleTimer);      t.idleTimer = null; }
+  if (t.sustainedTimer) { clearTimeout(t.sustainedTimer); t.sustainedTimer = null; }
+}
 
-const trackers: Record<AiKind, WorkingTracker> = {
-  claude: { startedAt: Date.now(), lastDataAt: 0, lastLargeDataAt: 0, accumulated: 0, browserOpened: false },
-  codex:  { startedAt: Date.now(), lastDataAt: 0, lastLargeDataAt: 0, accumulated: 0, browserOpened: false },
+const trackers: Record<AiKind, PtyTracker> = {
+  claude: makeTracker(),
+  codex:  makeTracker(),
 };
+
+// ─── Shared open / close helpers ────────────────────────────────────────────
+
+function openBrowser() {
+  if (autoOpenedAt !== 0) return;
+  autoOpenedAt = Date.now();
+  useStore.getState().setBrowserSidebarOpen(true);
+}
+
+function scheduleBrowserClose() {
+  if (idleCloseTimer) clearTimeout(idleCloseTimer);
+  idleCloseTimer = setTimeout(() => {
+    idleCloseTimer = null;
+    autoOpenedAt = 0;
+    useStore.getState().setBrowserSidebarOpen(false);
+  }, IDLE_MS);
+}
+
+// ─── PTY callbacks (same logic for both claude and codex) ───────────────────
+
+function onAiData(kind: AiKind, chunk: string) {
+  const mode = useStore.getState().settings?.browser.mode;
+  const t = trackers[kind];
+  if (mode === 'off' || !t.hasSentPrompt) return;
+
+  const stripped = chunk.replace(ANSI_STRIP, '').replace(/\s/g, '');
+  if (!stripped) return;
+
+  const fp = stripped.slice(0, 80);
+  if (t.recentFps.includes(fp)) return;
+  t.recentFps = [...t.recentFps.slice(-(FP_WINDOW - 1)), fp];
+
+  // Output flowing → reset idle timer.
+  if (t.idleTimer) { clearTimeout(t.idleTimer); t.idleTimer = null; }
+
+  // Arm sustained-output timer on the first unique byte.
+  // Fires only if output keeps flowing for SUSTAINED_MS → real work → open.
+  if (!t.sustainedTimer) {
+    t.sustainedTimer = setTimeout(() => {
+      t.sustainedTimer = null;
+      openBrowser();
+    }, SUSTAINED_MS);
+  }
+
+  // Schedule idle detection: output stopped → close (or cancel open).
+  t.idleTimer = setTimeout(() => {
+    t.idleTimer = null;
+    t.hasSentPrompt = false;   // this turn is over; next slash command won't leak through
+    t.recentFps = [];
+    if (t.sustainedTimer) { clearTimeout(t.sustainedTimer); t.sustainedTimer = null; }
+    if (autoOpenedAt > 0) scheduleBrowserClose();
+  }, IDLE_MS);
+}
+
+function onAiInput(kind: AiKind, chunk: string) {
+  const mode = useStore.getState().settings?.browser.mode;
+  if (mode === 'off') return;
+
+  const t = trackers[kind];
+  for (const ch of chunk) {
+    if (ch === '\r' || ch === '\n') {
+      const line = t.inputBuffer.trim();
+      t.inputBuffer = '';
+      // Slash commands (/resume, /clear, /help…) and empty lines are never real prompts.
+      // Also reset hasSentPrompt so prior-turn state doesn't leak into this output.
+      if (!line || line.startsWith('/')) {
+        t.hasSentPrompt = false;
+        t.recentFps = [];
+        t.slashInteractionActive = true;  // next Enter may be a menu selection
+        if (t.sustainedTimer) { clearTimeout(t.sustainedTimer); t.sustainedTimer = null; }
+        if (t.idleTimer)      { clearTimeout(t.idleTimer);      t.idleTimer = null; }
+        continue;
+      }
+
+      // If a slash command just ran (e.g. /resume showed a session list) and the user
+      // typed a digit-only response to pick from the menu, swallow it — it's not a
+      // real coding prompt and the history dump that follows must not open the browser.
+      if (t.slashInteractionActive) {
+        t.slashInteractionActive = false;
+        if (/^\d+$/.test(line)) continue;
+      }
+
+      t.hasSentPrompt = true;
+      t.recentFps = [];
+      if (t.sustainedTimer) { clearTimeout(t.sustainedTimer); t.sustainedTimer = null; }
+      if (t.idleTimer)      { clearTimeout(t.idleTimer);      t.idleTimer = null; }
+    } else if (ch === '\x7f' || ch === '\b') {
+      t.inputBuffer = t.inputBuffer.slice(0, -1);
+    } else if (ch >= ' ') {
+      t.inputBuffer += ch;
+    }
+  }
+}
+
+// ─── Component ──────────────────────────────────────────────────────────────
 
 export default function AIPanel() {
   const open          = useStore((s) => s.aiPanelOpen);
@@ -70,43 +168,21 @@ export default function AIPanel() {
 
   const [nonces, setNonces] = useState<Record<AiKind, number>>({ claude: 0, codex: 0 });
 
-  function onAiData(kind: AiKind, chunk: string) {
-    if (!settings?.browser.autoOpen) return;
-
-    const tracker = trackers[kind];
-    const now = Date.now();
-
-    if (now - tracker.startedAt < STARTUP_GRACE_MS) return;
-
-    // Decay burst if there's been a long pause (user is idle, not AI working)
-    if (tracker.lastDataAt > 0 && now - tracker.lastDataAt > BURST_DECAY_MS) {
-      tracker.accumulated = 0;
-      tracker.browserOpened = false;
+  // Detect manual close.
+  useEffect(() => {
+    if (!browserOpen && autoOpenedAt > 0) {
+      autoOpenedAt = 0;
+      if (idleCloseTimer) { clearTimeout(idleCloseTimer); idleCloseTimer = null; }
     }
-    tracker.lastDataAt = now;
+  }, [browserOpen]);
 
-    // Count non-whitespace chars after stripping control sequences
-    const nonWs = chunk.replace(ANSI_STRIP, '').replace(/\s/g, '').length;
-    tracker.accumulated += nonWs;
-
-    // Open browser once burst crosses threshold — never auto-close
-    if (!tracker.browserOpened && tracker.accumulated >= BURST_THRESHOLD) {
-      tracker.browserOpened = true;
-      setBrowser(true);
-    }
-  }
-
-  // Reset tracker when PTY exits (new process starts fresh)
-  function resetTracker(kind: AiKind) {
-    trackers[kind] = { startedAt: Date.now(), lastDataAt: 0, accumulated: 0, browserOpened: false };
-  }
-
-  // Reset trackers on unmount so stale startedAt doesn't bypass grace period on remount
+  // Clean up on unmount.
   useEffect(() => {
     return () => {
-      for (const k of Object.keys(trackers) as AiKind[]) {
-        trackers[k] = { startedAt: Date.now(), lastDataAt: 0, accumulated: 0, browserOpened: false };
-      }
+      autoOpenedAt = 0;
+      if (idleCloseTimer) { clearTimeout(idleCloseTimer); idleCloseTimer = null; }
+      clearTracker(trackers.claude);
+      clearTracker(trackers.codex);
     };
   }, []);
 
@@ -126,8 +202,10 @@ export default function AIPanel() {
   }
 
   function restart(kind: AiKind) {
+    autoOpenedAt = 0;
+    if (idleCloseTimer) { clearTimeout(idleCloseTimer); idleCloseTimer = null; }
+    clearTracker(trackers[kind]);
     setNonces((prev) => ({ ...prev, [kind]: prev[kind] + 1 }));
-    resetTracker(kind);
     setBrowser(false);
   }
 
@@ -160,7 +238,6 @@ export default function AIPanel() {
 
         <div className="flex-1" />
 
-        {/* Manual browser toggle */}
         <motion.button
           whileTap={{ scale: 0.94 }}
           onClick={() => setBrowser(!browserOpen)}
@@ -209,43 +286,12 @@ export default function AIPanel() {
                 bypass={settings.ai[kind].bypassPermissions}
                 cwd={workspacePath || undefined}
                 onData={(chunk) => onAiData(kind, chunk)}
-                onExit={() => resetTracker(kind)}
+                onInput={(chunk) => onAiInput(kind, chunk)}
               />
             </div>
           );
         })}
       </div>
     </div>
-  );
-}
-
-function AiTerminal({
-  kind, nonce, bypass, cwd, onData, onExit,
-}: {
-  kind: AiKind;
-  nonce: number;
-  bypass: boolean;
-  cwd?: string;
-  onData?: (c: string) => void;
-  onExit?: (code: number) => void;
-}) {
-  const isWin = window.api.app.platform === 'win32';
-  const flags = bypass ? bypassFlag(kind).join(' ') : '';
-  const bin   = AI_BIN[kind];
-  const cmd   = `${bin}${flags ? ' ' + flags : ''}; echo; echo "[${AI_LABEL[kind]} exited — press enter]"; read; exec bash -l`;
-
-  const shellArgs = isWin
-    ? ['-NoLogo', '-Command', cmd]
-    : ['-lc', cmd];
-
-  return (
-    <TerminalView
-      id={`ai-${kind}-${nonce}`}
-      shell={isWin ? 'powershell.exe' : '/bin/bash'}
-      args={shellArgs}
-      cwd={cwd}
-      onData={onData}
-      onExit={onExit}
-    />
   );
 }

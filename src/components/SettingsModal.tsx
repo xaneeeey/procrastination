@@ -119,17 +119,25 @@ export default function SettingsModal() {
                       </motion.button>
                     ))}
                   </div>
-                  <label className="flex items-center gap-2 text-[12.5px]" style={{ color: 'var(--text-dim)' }}>
-                    <input
-                      type="checkbox"
-                      checked={settings.browser.autoOpen}
-                      onChange={(e) =>
-                        patchSettings({ browser: { ...settings.browser, autoOpen: e.target.checked } })
-                      }
-                      className="rounded"
-                    />
-                    auto-open when AI is working, auto-close when idle
-                  </label>
+                  <div className="flex gap-2">
+                    {(['off', 'monitored', 'full'] as const).map((m) => (
+                      <motion.button
+                        key={m}
+                        whileTap={{ scale: 0.97 }}
+                        onClick={() => patchSettings({ browser: { ...settings.browser, mode: m } })}
+                        className={`pill-btn ${settings.browser.mode === m ? 'active' : ''}`}
+                      >
+                        {m === 'off' && '🚫 off'}
+                        {m === 'monitored' && '👁 monitored'}
+                        {m === 'full' && '🎬 full'}
+                      </motion.button>
+                    ))}
+                  </div>
+                  <div className="text-[11.5px] mt-2" style={{ color: 'var(--text-faint)' }}>
+                    {settings.browser.mode === 'off' && 'Browser never auto-opens. Use the break button manually.'}
+                    {settings.browser.mode === 'monitored' && 'Browser opens beside the AI panel while it codes, closes when idle.'}
+                    {settings.browser.mode === 'full' && 'Browser takes over the full window while AI codes. AI panel returns when idle.'}
+                  </div>
                 </section>
 
                 <section>
@@ -241,6 +249,7 @@ export default function SettingsModal() {
     </AnimatePresence>
   );
 }
+
 
 function SectionHeader({ title, description }: { title: string; description: string }) {
   return (

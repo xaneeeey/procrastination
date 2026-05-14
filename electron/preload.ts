@@ -11,7 +11,7 @@ export type Settings = {
   theme: 'warm-light' | 'warm-dark';
   browser: {
     provider: 'instagram' | 'youtube';
-    autoOpen: boolean;
+    mode: 'off' | 'monitored' | 'full';
   };
   ai: {
     claude: { bypassPermissions: boolean };
@@ -73,6 +73,16 @@ const api = {
       const listener = (_: unknown, code: number) => cb(code);
       ipcRenderer.on(channel, listener);
       return () => { ipcRenderer.off(channel, listener); };
+    },
+  },
+  aiState: {
+    get: (): Promise<Record<string, string>> => ipcRenderer.invoke('aistate:get'),
+    setupHooks: (): Promise<boolean> => ipcRenderer.invoke('aistate:setup-hooks'),
+    removeHooks: (): Promise<boolean> => ipcRenderer.invoke('aistate:remove-hooks'),
+    onStateChange: (cb: (info: { kind: string; state: 'working' | 'idle' }) => void) => {
+      const listener = (_: unknown, info: { kind: string; state: 'working' | 'idle' }) => cb(info);
+      ipcRenderer.on('aistate:change', listener);
+      return () => { ipcRenderer.off('aistate:change', listener); };
     },
   },
   app: {

@@ -11,6 +11,7 @@ export type TerminalProps = {
   cwd?: string;
   env?: Record<string, string>;
   onData?: (chunk: string) => void;
+  onInput?: (chunk: string) => void;
   onExit?: (code: number) => void;
   autoRespawn?: boolean;
 };
@@ -41,7 +42,13 @@ export default function TerminalView(props: TerminalProps) {
 
     const fit = new FitAddon();
     xterm.loadAddon(fit);
-    xterm.loadAddon(new WebLinksAddon((_, url) => window.api.app.openExternal(url)));
+    xterm.loadAddon(new WebLinksAddon((ev, url) => {
+      if (ev.ctrlKey || ev.metaKey) {
+        useStore.getState().setPreview(true, url);
+      } else {
+        window.api.app.openExternal(url);
+      }
+    }));
     xterm.open(containerRef.current);
 
     xtermRef.current = xterm;
@@ -99,6 +106,7 @@ export default function TerminalView(props: TerminalProps) {
 
     const dataSub = xterm.onData((d) => {
       window.api.pty.write(props.id, d);
+      propsRef.current.onInput?.(d);
     });
 
     const ro = new ResizeObserver(() => {

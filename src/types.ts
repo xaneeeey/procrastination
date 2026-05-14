@@ -17,7 +17,7 @@ export type Settings = {
   theme: 'warm-light' | 'warm-dark';
   browser: {
     provider: 'instagram' | 'youtube';
-    autoOpen: boolean;
+    mode: 'off' | 'monitored' | 'full';
   };
   ai: {
     claude: { bypassPermissions: boolean };

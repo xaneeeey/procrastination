@@ -18,7 +18,7 @@ type Settings = {
   theme: 'warm-light' | 'warm-dark';
   browser: {
     provider: 'instagram' | 'youtube';
-    autoOpen: boolean;
+    mode: 'off' | 'monitored' | 'full';
   };
   ai: {
     claude: { bypassPermissions: boolean };
@@ -32,7 +32,7 @@ const DEFAULT_SETTINGS: Settings = {
   theme: 'warm-light',
   browser: {
     provider: 'instagram',
-    autoOpen: true,
+    mode: 'monitored' as const,
   },
   ai: {
     claude: { bypassPermissions: false },
@@ -56,7 +56,12 @@ async function loadSettings(): Promise<Settings> {
   try {
     const raw = await fs.readFile(SETTINGS_PATH, 'utf-8');
     const parsed = JSON.parse(raw);
-    return { ...DEFAULT_SETTINGS, ...parsed, browser: { ...DEFAULT_SETTINGS.browser, ...(parsed.browser || {}) }, ai: { ...DEFAULT_SETTINGS.ai, ...(parsed.ai || {}) }, runCommands: { ...DEFAULT_SETTINGS.runCommands, ...(parsed.runCommands || {}) } };
+    const browserMerged = { ...DEFAULT_SETTINGS.browser, ...(parsed.browser || {}) };
+    // Migrate old autoOpen boolean to the new mode enum
+    if ('autoOpen' in browserMerged && !('mode' in (parsed.browser || {}))) {
+      browserMerged.mode = (browserMerged as unknown as { autoOpen: boolean }).autoOpen ? 'monitored' : 'off';
+    }
+    return { ...DEFAULT_SETTINGS, ...parsed, browser: browserMerged, ai: { ...DEFAULT_SETTINGS.ai, ...(parsed.ai || {}) }, runCommands: { ...DEFAULT_SETTINGS.runCommands, ...(parsed.runCommands || {}) } };
   } catch {
     return { ...DEFAULT_SETTINGS };
   }
@@ -112,6 +117,7 @@ app.whenReady().then(() => {
   });
 
   createWindow();
+  startAiStatePolling();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -292,6 +298,97 @@ function defaultShell(): string {
   if (process.platform === 'win32') return process.env['COMSPEC'] || 'powershell.exe';
   return process.env['SHELL'] || '/bin/bash';
 }
+
+// ─── AI State Polling ──────────────────────────────────────────────────────
+// Reads /tmp/claude-code-state and /tmp/codex-state written by Claude Code
+// hooks (UserPromptSubmit/PreToolUse → "working", Stop → "idle").
+
+const STATE_FILES = {
+  claude: '/tmp/claude-code-state',
+  codex:  '/tmp/codex-state',
+} as const;
+type AiStateKind = keyof typeof STATE_FILES;
+const lastAiState: Record<AiStateKind, string> = { claude: '', codex: '' };
+
+function startAiStatePolling() {
+  setInterval(async () => {
+    if (!mainWindow) return;
+    for (const kind of Object.keys(STATE_FILES) as AiStateKind[]) {
+      try {
+        const raw = await fs.readFile(STATE_FILES[kind], 'utf-8');
+        const state = raw.trim() === 'working' ? 'working' : 'idle';
+        if (state !== lastAiState[kind]) {
+          lastAiState[kind] = state;
+          mainWindow.webContents.send('aistate:change', { kind, state });
+        }
+      } catch {
+        // File doesn't exist — hooks not configured yet, skip silently.
+      }
+    }
+  }, 500);
+}
+
+ipcMain.handle('aistate:get', () => ({ ...lastAiState }));
+
+ipcMain.handle('aistate:remove-hooks', async () => {
+  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+  try {
+    const raw = await fs.readFile(settingsPath, 'utf-8');
+    const cfg = JSON.parse(raw) as Record<string, unknown>;
+    const hooks = cfg['hooks'] as Record<string, unknown[]> | undefined;
+    if (!hooks) return true;
+    const cmds = new Set(['echo working > /tmp/claude-code-state', 'echo idle > /tmp/claude-code-state']);
+    function stripCmd(entries: unknown[]): unknown[] {
+      return (entries as Array<{ hooks?: Array<{ command?: string }> }>)
+        .map((e) => ({ ...e, hooks: (e.hooks ?? []).filter((h) => !cmds.has(h.command ?? '')) }))
+        .filter((e) => (e.hooks ?? []).length > 0);
+    }
+    for (const key of Object.keys(hooks)) {
+      hooks[key] = stripCmd(hooks[key]);
+      if (hooks[key].length === 0) delete hooks[key];
+    }
+    if (Object.keys(hooks).length === 0) delete cfg['hooks'];
+    else cfg['hooks'] = hooks;
+    await fs.writeFile(settingsPath, JSON.stringify(cfg, null, 2), 'utf-8');
+  } catch { /* file missing = nothing to remove */ }
+  return true;
+});
+
+ipcMain.handle('aistate:setup-hooks', async () => {
+  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+
+  let cfg: Record<string, unknown> = {};
+  try {
+    cfg = JSON.parse(await fs.readFile(settingsPath, 'utf-8')) as Record<string, unknown>;
+  } catch { /* new file */ }
+
+  const hooks = (cfg['hooks'] as Record<string, unknown[]> | undefined) ?? {};
+
+  const workingCmd = 'echo working > /tmp/claude-code-state';
+  const idleCmd    = 'echo idle > /tmp/claude-code-state';
+
+  function hasCmd(entries: unknown[], cmd: string): boolean {
+    return (entries as Array<{ hooks?: Array<{ command?: string }> }>)
+      .some((e) => (e.hooks ?? []).some((h) => h.command === cmd));
+  }
+
+  if (!hooks['UserPromptSubmit']) hooks['UserPromptSubmit'] = [];
+  if (!hasCmd(hooks['UserPromptSubmit'], workingCmd))
+    hooks['UserPromptSubmit'].push({ hooks: [{ type: 'command', command: workingCmd }] });
+
+  if (!hooks['PreToolUse']) hooks['PreToolUse'] = [];
+  if (!hasCmd(hooks['PreToolUse'], workingCmd))
+    hooks['PreToolUse'].push({ matcher: '.*', hooks: [{ type: 'command', command: workingCmd }] });
+
+  if (!hooks['Stop']) hooks['Stop'] = [];
+  if (!hasCmd(hooks['Stop'], idleCmd))
+    hooks['Stop'].push({ hooks: [{ type: 'command', command: idleCmd }] });
+
+  cfg['hooks'] = hooks;
+  await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+  await fs.writeFile(settingsPath, JSON.stringify(cfg, null, 2), 'utf-8');
+  return true;
+});
 
 // ─── Misc ──────────────────────────────────────────────────────────────────
 

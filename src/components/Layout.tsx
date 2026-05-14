@@ -28,7 +28,7 @@ export default function Layout() {
   return (
     <div className="flex flex-col h-full w-full overflow-hidden">
       <TitleBar />
-      <div className="flex-1 flex min-h-0 min-w-0">
+      <div className="flex-1 flex min-h-0 min-w-0 relative">
         {previewOpen ? (
           /* Preview mode: full left area is the preview panel */
           <div className="flex-1 flex flex-col min-w-0 min-h-0">
@@ -59,7 +59,7 @@ export default function Layout() {
         {/* AI Panel (resizable) */}
         <AiSection width={aiWidth} setWidth={setAiWidth} />
 
-        {/* Browser sidebar — width is animated by component itself */}
+        {/* Browser sidebar — in monitored mode: flex sibling; in full mode: absolute overlay */}
         <BrowserSidebar />
       </div>
     </div>
@@ -68,11 +68,31 @@ export default function Layout() {
 
 function AiSection({ width, setWidth }: { width: number; setWidth: (w: number | ((p: number) => number)) => void }) {
   const isOpen = useStore((s) => s.aiPanelOpen);
+  const browserOpen = useStore((s) => s.browserSidebarOpen);
+  const mode = useStore((s) => s.settings?.browser.mode);
+
   if (!isOpen) return null;
+
+  // In FULL mode while browser is open: keep AIPanel mounted (terminals keep running)
+  // but shrink it to width=0 so the overlay has the full canvas.
+  //
+  // IMPORTANT: AIPanel's div must always be at the SAME index in the Fragment.
+  // If it shifts position (e.g. index 1 → index 0 when Splitter disappears),
+  // React sees a type mismatch at that slot and remounts AIPanel, killing the
+  // terminal and spawning a new codex instance. The placeholder <div> below
+  // holds position 0 steady so AIPanel stays at index 1 in all cases.
+  const isHidden = mode === 'full' && browserOpen;
+
   return (
     <>
-      <Splitter onDrag={(dx) => setWidth((w) => Math.min(AI_MAX, Math.max(AI_MIN, w - dx)))} />
-      <div style={{ width }} className="shrink-0 h-full">
+      {isHidden
+        ? <div style={{ display: 'none' }} />
+        : <Splitter onDrag={(dx) => setWidth((w) => Math.min(AI_MAX, Math.max(AI_MIN, w - dx)))} />
+      }
+      <div
+        style={{ width: isHidden ? 0 : width, overflow: isHidden ? 'hidden' : undefined }}
+        className="shrink-0 h-full"
+      >
         <AIPanel />
       </div>
     </>
